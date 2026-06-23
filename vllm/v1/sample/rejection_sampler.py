@@ -638,6 +638,67 @@ def sample_recovered_tokens(
     return recovered_token_ids
 
 
+def compute_probs(
+    logits: torch.Tensor,  # [num_tokens, vocab_size]
+    cu_num_draft_tokens: torch.Tensor,  # [batch_size]
+    sampling_metadata: SamplingMetadata,
+) -> torch.Tensor:
+    """Compute probability distribution from logits based on sampling metadata.
+
+    This function applies temperature scaling to the logits and converts
+    them to probabilities using softmax. For greedy decoding, it returns
+    the original logits.
+
+    Args:
+        logits: Input logits tensor to be converted to probabilities.
+        cu_num_draft_tokens: Cumulative number of draft tokens.
+        sampling_metadata: Metadata containing sampling parameters such as
+            temperature and whether greedy sampling is used.
+
+    Returns:
+        torch.Tensor: Probability distribution (softmax of scaled logits)
+            if non-greedy sampling is used, otherwise returns the
+            original logits.
+    """
+    assert logits.ndim == 2
+    assert cu_num_draft_tokens.ndim == 1
+    if sampling_metadata.all_greedy:
+        return logits
+
+    num_tokens = logits.shape[0]
+    temperature = expand_batch_to_tokens(
+        sampling_metadata.temperature,
+        cu_num_draft_tokens,
+        num_tokens,
+        replace_from=GREEDY_TEMPERATURE,
+        replace_to=1,
+    )
+    # NOTE(woosuk): Update `logits` in place to avoid allocating a new tensor.
+    logits.div_(temperature.unsqueeze(-1))
+
+    # Get expanded top_k and top_p tensors.
+    top_k = None
+    if sampling_metadata.top_k is not None:
+        top_k = expand_batch_to_tokens(
+            sampling_metadata.top_k,
+            cu_num_draft_tokens,
+            num_tokens,
+        )
+    top_p = None
+    if sampling_metadata.top_p is not None:
+        top_p = expand_batch_to_tokens(
+            sampling_metadata.top_p,
+            cu_num_draft_tokens,
+            num_tokens,
+        )
+
+    # NOTE(woosuk): `apply_top_k_top_p` uses sorting to calculate the mask,
+    # which is slow for large vocab sizes. This may cause performance issues.
+    logits = apply_top_k_top_p(logits.float(), top_k, top_p)
+    output_prob = logits.softmax(dim=-1, dtype=torch.float32)
+    return output_prob
+
+
 # NOTE(woosuk): Avoid specialization to prevent unnecessary recompilation.
 @triton.jit(do_not_specialize=["max_spec_len"])
 def rejection_greedy_sample_kernel(

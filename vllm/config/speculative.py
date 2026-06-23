@@ -50,6 +50,7 @@ SpeculativeMethod = Literal[
     "draft_model",
     "suffix",
     EagleModelTypes,
+    "sparse_attn",
 ]
 
 
@@ -158,6 +159,18 @@ class SpeculativeConfig:
     """The minimum token probability for suffix decoding. Will only speculate
     tokens with estimated probability (based on frequency counts) greater than
     or equal to this value."""
+
+    # Self-speculative decoding with sparse attention
+    sparse_attn_algorithm: Literal["streamingllm", "vegas"] = "streamingllm"
+    """The KV sparsity pattern used by self-speculative decoding."""
+
+    sparse_attn_ratio: float = Field(default=0.05, gt=0, lt=1)
+    """The ratio of tokens to attend to in sparse attention. Only used when
+    sparse_attn_algorithm is specified. Defaults to 0.05."""
+
+    sparse_attn_min_tokens: int = Field(default=256, gt=0)
+    """The minimum number of tokens to attend to in sparse attention. Only used
+    when sparse_attn_algorithm is specified. Defaults to 256."""
 
     def compute_hash(self) -> str:
         """
@@ -313,6 +326,8 @@ class SpeculativeConfig:
                 self.model = "ngram"
             elif self.method == "suffix":
                 self.model = "suffix"
+            elif self.method == "sparse_attn":
+                self.model = "sparse_attn"
             else:
                 raise ValueError(
                     "num_speculative_tokens was provided but without speculative model."
@@ -362,6 +377,8 @@ class SpeculativeConfig:
             self.draft_parallel_config = self.target_parallel_config
         elif self.method == "suffix":
             self._validate_suffix_decoding()
+        elif self.method == "sparse_attn":
+            pass
         else:
             self.prompt_lookup_max = 0
             self.prompt_lookup_min = 0
@@ -735,6 +752,7 @@ class SpeculativeConfig:
 
     def __repr__(self) -> str:
         method = self.method
-        model = None if method in ("ngram", "suffix") else self.draft_model_config.model
+        model = None if method in ("ngram", "suffix", "sparse_attn") \
+            else self.draft_model_config.model
         num_spec_tokens = self.num_speculative_tokens
         return f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=})"

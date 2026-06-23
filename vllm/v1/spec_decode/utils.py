@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
 import torch
+from torch.utils.cpp_extension import load_inline
 
 from vllm.config import VllmConfig, replace
 from vllm.triton_utils import tl, triton
@@ -355,3 +357,143 @@ def copy_and_expand_eagle_inputs_kernel(
         out_idx,
         mask=is_new_token_region & in_bounds,
     )
+
+
+# Kernel: gather_draft_hidden_states
+# Gathers variable-length draft hidden states from a padded [B, K, H]
+# tensor into a compact [N, H] tensor, with optional batch reorder
+# mapping.  Uses float4 (128-bit) vectorized loads for maximum memory
+# bandwidth.  Dtype-agnostic (float16 / bfloat16 / float32) as long as
+# hidden_size * element_size is a multiple of 16 bytes.
+
+_GATHER_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <algorithm>
+
+__global__ void gather_hidden_kernel(
+    const char* __restrict__ src,
+    char* __restrict__ output,
+    const int* __restrict__ cu_num_tokens,
+    const int* __restrict__ mapping,
+    long src_batch_stride_bytes,
+    long src_token_stride_bytes,
+    long out_row_stride_bytes,
+    int row_size_float4,
+    bool has_mapping
+) {
+    const int req_idx   = blockIdx.x;
+    const int token_idx = blockIdx.y;
+
+    const int src_row  = has_mapping ? mapping[req_idx] : req_idx;
+    const int start    = req_idx > 0 ? cu_num_tokens[req_idx - 1] : 0;
+    const int n_tokens = cu_num_tokens[req_idx] - start;
+
+    if (token_idx >= n_tokens) return;
+
+    const float4* __restrict__ src_f4 = reinterpret_cast<const float4*>(
+        src + src_row * src_batch_stride_bytes
+            + token_idx * src_token_stride_bytes);
+    float4* __restrict__ dst_f4 = reinterpret_cast<float4*>(
+        output + (start + token_idx) * out_row_stride_bytes);
+
+    for (int i = threadIdx.x; i < row_size_float4; i += blockDim.x) {
+        dst_f4[i] = __ldg(&src_f4[i]);
+    }
+}
+
+torch::Tensor gather_cuda(
+    torch::Tensor src,
+    torch::Tensor cu_num_draft_tokens,
+    int64_t total_tokens,
+    int64_t batch_size,
+    c10::optional<torch::Tensor> reorder_mapping
+) {
+    const int hidden_size     = src.size(-1);
+    const int max_spec_tokens = src.size(1);
+    const int elem_size       = src.element_size();
+
+    auto output = torch::empty({total_tokens, hidden_size}, src.options());
+
+    if (total_tokens == 0 || batch_size == 0) return output;
+
+    const long src_batch_stride_bytes = src.stride(0) * elem_size;
+    const long src_token_stride_bytes = src.stride(1) * elem_size;
+    const long out_row_stride_bytes   = output.stride(0) * elem_size;
+    const int row_bytes       = hidden_size * elem_size;
+    const int row_size_float4 = row_bytes / 16;
+
+    const bool has_mapping = reorder_mapping.has_value();
+    const int* mapping_ptr = has_mapping
+        ? reorder_mapping.value().data_ptr<int>() : nullptr;
+
+    dim3 grid(batch_size, max_spec_tokens);
+    int block_size = std::min(row_size_float4, 256);
+    block_size = std::max(block_size, 1);
+
+    gather_hidden_kernel<<<grid, block_size>>>(
+        reinterpret_cast<const char*>(src.data_ptr()),
+        reinterpret_cast<char*>(output.data_ptr()),
+        cu_num_draft_tokens.data_ptr<int>(),
+        mapping_ptr,
+        src_batch_stride_bytes,
+        src_token_stride_bytes,
+        out_row_stride_bytes,
+        row_size_float4,
+        has_mapping
+    );
+
+    return output;
+}
+"""
+
+_GATHER_CUDA_DECL = """
+torch::Tensor gather_cuda(
+    torch::Tensor src,
+    torch::Tensor cu_num_draft_tokens,
+    int64_t total_tokens,
+    int64_t batch_size,
+    c10::optional<torch::Tensor> reorder_mapping);
+"""
+
+
+@functools.lru_cache(maxsize=1)
+def _get_gather_cuda_module():
+    return load_inline(
+        name="gather_hs_cuda",
+        cpp_sources=_GATHER_CUDA_DECL,
+        cuda_sources=_GATHER_CUDA_SRC,
+        functions=["gather_cuda"],
+        verbose=False,
+        extra_cuda_cflags=["-O3", "--use_fast_math"],
+    )
+
+
+def gather_draft_hidden_states(
+    src: torch.Tensor,
+    cu_num_draft_tokens: torch.Tensor,
+    total_tokens: int,
+    batch_size: int,
+    reorder_mapping: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Gather draft hidden states from a padded buffer into a compact tensor.
+
+    Args:
+        src: Source tensor of shape
+            ``[max_batch, max_spec_tokens, hidden_size]``.
+        cu_num_draft_tokens: Cumulative token counts ``[batch_size]``
+            where ``cu[i]`` is the total number of draft tokens up to
+            and including request *i*.
+        total_tokens: Total output tokens (``cu_num_draft_tokens[-1]``).
+            Passed explicitly to avoid a device-to-host sync.
+        batch_size: Number of active requests.
+        reorder_mapping: Optional ``[batch_size]`` int32 tensor that maps
+            each current request index to its row in *src*.
+            Pass ``None`` for identity mapping (no reorder).
+
+    Returns:
+        Compact tensor of shape ``[total_tokens, hidden_size]``.
+    """
+    mod = _get_gather_cuda_module()
+    return mod.gather_cuda(
+        src, cu_num_draft_tokens, total_tokens, batch_size, reorder_mapping)
