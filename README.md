@@ -39,7 +39,7 @@ Vegas is implemented as a fork of vLLM and builds against a companion
 FlashAttention-3). Build from source:
 
 ```bash
-git clone https://github.com/npz7yyk/vegas.git
+git clone https://github.com/platformxlab/vegas.git
 cd vegas
 pip install -v -e .   # compiles the CUDA/FA3 kernels; takes a while
 pip install datasets  # for benchmarks
