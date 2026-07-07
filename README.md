@@ -3,10 +3,10 @@
 # Vegas: Verification-Guided Sparse Attention for Self-Speculative Decoding
 
 [![Paper](https://img.shields.io/badge/arXiv-2602.07223-b31b1b.svg)](https://arxiv.org/abs/2602.07223)
+[![Poster](https://img.shields.io/badge/Poster-ICML%202026-1f6feb.svg)](assets/poster.png)
 
-<!-- TODO: add teaser/overview figure -->
 <p align="center">
-  <img alt="Vegas overview" src="assets/overview.png" width=80%>
+  <img alt="Vegas overview" src="assets/overview.png" width=90%>
 </p>
 
 ## Abstract
